@@ -1,0 +1,20 @@
+# Credentials and local configuration
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+
+# Uploaded documents, generated indexes, dependencies, and builds
+backend/data/
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor and OS files
+.idea/
+.DS_Store

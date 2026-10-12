@@ -1,0 +1,353 @@
+openapi: 3.1.0
+info:
+  title: RAG Demo API
+  version: 1.1.0
+  description: |
+    多模态 PDF RAG 系统后端接口（FastAPI）。
+    - 解析管线：上传 → 异步解析 → 状态轮询 → 页图获取
+    - 索引管线：Markdown 切分 → 向量化（FAISS）→ 相似检索
+    - 对话：SSE 流式回答，带检索引用（citation）事件，支持内存多轮会话与一键清空
+servers:
+  - url: http://localhost:8001/api/v1
+    description: Local dev
+
+tags:
+  - name: Health
+  - name: PDF
+  - name: Index
+  - name: Chat
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: 健康检查
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /pdf/upload:
+    post:
+      tags: [PDF]
+      operationId: uploadPdf
+      summary: 上传 PDF（单文件）
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                replace:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: 上传成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PdfUploaded"
+
+  /pdf/parse:
+    post:
+      tags: [PDF]
+      operationId: startParse
+      summary: 触发异步解析（OCR/布局可视化/Markdown 导出）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileId]
+              properties:
+                fileId:
+                  type: string
+      responses:
+        "202":
+          description: 已接受解析任务
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAccepted"
+
+  /pdf/status:
+    get:
+      tags: [PDF]
+      operationId: getParseStatus
+      summary: 查询解析状态
+      parameters:
+        - in: query
+          name: fileId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 当前状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ParseStatus"
+
+  /pdf/page:
+    get:
+      tags: [PDF]
+      operationId: getPdfPage
+      summary: 获取页图（原始/解析叠框）
+      parameters:
+        - in: query
+          name: fileId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: page
+          required: true
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: type
+          required: true
+          schema:
+            type: string
+            enum: [original, parsed]
+      responses:
+        "200":
+          description: PNG 图片
+          content:
+            image/png: {}
+        "204":
+          description: 尚未解析完成（请求 parsed 时）
+        "404":
+          description: 页码不存在或未生成
+
+  /pdf/chunk:
+    get:
+      tags: [PDF]
+      operationId: getCitationChunk
+      summary: 根据 citationId 获取片段详情（可用于弹窗展示）
+      parameters:
+        - in: query
+          name: citationId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 命中的片段
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CitationChunk"
+
+  /index/build:
+    post:
+      tags: [Index]
+      operationId: buildIndex
+      summary: 构建向量索引（FAISS）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileId]
+              properties:
+                fileId: { type: string }
+      responses:
+        "200":
+          description: 构建完成
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  chunks: { type: integer, example: 42 }
+        "409":
+          description: 需先完成解析（未找到 output.md）
+
+  /index/search:
+    post:
+      tags: [Index]
+      operationId: searchIndex
+      summary: 相似检索（Top-K）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fileId, query]
+              properties:
+                fileId: { type: string }
+                query: { type: string }
+                k: { type: integer, default: 5, minimum: 1, maximum: 20 }
+      responses:
+        "200":
+          description: 检索结果
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResults"
+        "400":
+          description: 未构建索引
+
+  /chat:
+    post:
+      tags: [Chat]
+      operationId: chatSSE
+      summary: RAG 聊天（SSE 流式）
+      description: |
+        **事件类型**：
+        - `citation`：发送检索引用（用于前端角标/弹窗）
+        - `token`：回答的增量文本
+        - `done`：结束，包含 {"used_retrieval": true|false}
+        - `error`：异常信息
+
+        **注意**：`content-type: text/event-stream`。Swagger UI 对 SSE 显示不友好，建议用 curl 或前端联调。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: SSE 事件流（text/event-stream）
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  event: citation
+                  data: {"citation_id":"f_xxx-c1","fileId":"f_xxx","rank":1,"page":1,"previewUrl":"/api/v1/pdf/page?fileId=f_xxx&page=1&type=original"}
+
+                  event: token
+                  data: {"text":"你好，我是..."}
+
+                  event: done
+                  data: {"used_retrieval": true}
+        "4XX":
+          description: 请求错误
+        "5XX":
+          description: 服务器错误
+
+  /chat/clear:
+    post:
+      tags: [Chat]
+      operationId: clearSession
+      summary: 清空会话历史（内存态）
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sessionId:
+                  type: string
+                  description: 会话标识，不传则为 "default"
+      responses:
+        "200":
+          description: 已清空
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  sessionId: { type: string, example: default }
+                  cleared: { type: boolean, example: true }
+
+components:
+  schemas:
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+
+    PdfUploaded:
+      type: object
+      properties:
+        fileId: { type: string, example: f_7ibnm22t }
+        name:   { type: string, example: "course.pdf" }
+        pages:  { type: integer, example: 12 }
+
+    JobAccepted:
+      type: object
+      properties:
+        jobId: { type: string, example: j_abcd1234 }
+
+    ParseStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [idle, parsing, ready, error]
+          example: ready
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 100
+        errorMsg:
+          type: string
+          nullable: true
+
+    CitationChunk:
+      type: object
+      properties:
+        id:      { type: string, example: "f_7ibnm22t-c3" }
+        fileId:  { type: string, example: "f_7ibnm22t" }
+        page:    { type: integer, example: 6 }
+        snippet: { type: string }
+        bbox:
+          type: array
+          items: { type: number }
+          minItems: 4
+          maxItems: 4
+        previewUrl:
+          type: string
+          example: "/api/v1/pdf/page?fileId=f_7ibnm22t&page=6&type=original"
+
+    SearchResults:
+      type: object
+      properties:
+        ok: { type: boolean, example: true }
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              text: { type: string }
+              score: { type: number, format: float }
+              metadata:
+                type: object
+                additionalProperties: true
+
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: 用户问题
+          example: 请帮我介绍下LangChain框架的优劣势？
+        sessionId:
+          type: string
+          description: 会话标识；不传则为 "default"
+          example: default
+        pdfFileId:
+          type: string
+          description: RAG 的 fileId；不传时走通识回答
+          example: f_7ibnm22t
