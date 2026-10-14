@@ -4,13 +4,10 @@ python-multipart
 pymupdf
 pillow
 matplotlib
-html2text
-unstructured
-langchain-unstructured
-paddleocr
-paddlenlp
 dotenv
 faiss-cpu
+numpy
+openai
 langgraph
 langchain
 langchain-openai

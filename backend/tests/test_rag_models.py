@@ -43,8 +43,11 @@ def load_module():
         "services.embedding_service": fake_module(
             "services.embedding_service",
             DEFAULT_BASE_URL="https://api.siliconflow.cn/v1",
-            ensure_index_compatible=lambda path: None,
+            ensure_index_compatible=lambda path, vision_model: None,
             load_embeddings=lambda: None,
+        ),
+        "services.image_index_service": fake_module(
+            "services.image_index_service", vision_model=lambda: "Qwen/Qwen3.6-35B-A3B"
         ),
     }
     with patch.dict(sys.modules, modules):
@@ -87,6 +90,28 @@ class RagModelTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(citations), 1)
         self.assertEqual(context, "")
+
+    def test_retrieval_includes_image_description_and_direct_image_citation(self):
+        class Grader:
+            async def ainvoke(self, messages):
+                return types.SimpleNamespace(content="yes")
+
+        image_doc = types.SimpleNamespace(
+            page_content="流程图展示了上传、解析和检索三个步骤",
+            metadata={"kind": "image", "page": 2, "imagePath": "page2_img1.png"},
+        )
+        self.rag._load_vs = lambda file_id: types.SimpleNamespace(
+            similarity_search_with_score=lambda question, k: [(image_doc, 0.1)]
+        )
+        self.rag._get_grader = lambda: Grader()
+
+        citations, context = asyncio.run(self.rag.retrieve("流程图展示什么？", "file-1"))
+        self.assertEqual(len(citations), 1)
+        self.assertEqual(citations[0]["kind"], "image")
+        self.assertEqual(citations[0]["page"], 2)
+        self.assertEqual(citations[0]["previewUrl"], citations[0]["imageUrl"])
+        self.assertIn("上传、解析和检索", context)
+        self.assertIn("page2_img1.png", context)
 
 
 if __name__ == "__main__":

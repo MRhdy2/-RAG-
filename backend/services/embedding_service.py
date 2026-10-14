@@ -4,12 +4,16 @@ import json
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 
+load_dotenv(override=True)
 
-DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
+
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-VL-Embedding-8B"
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 METADATA_FILENAME = "embedding.json"
+INDEX_SCHEMA = "unified-text-image-v1"
 
 
 class IndexRebuildRequiredError(ValueError):
@@ -36,19 +40,27 @@ def load_embeddings() -> OpenAIEmbeddings:
     )
 
 
-def save_index_metadata(index_path: Path) -> None:
-    metadata = {"provider": "siliconflow", "model": embedding_model()}
+def save_index_metadata(index_path: Path, vision_model: str) -> None:
+    metadata = {
+        "provider": "siliconflow",
+        "model": embedding_model(),
+        "vision_model": vision_model,
+        "schema": INDEX_SCHEMA,
+    }
     (index_path / METADATA_FILENAME).write_text(
         json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
     )
 
 
-def ensure_index_compatible(index_path: Path) -> None:
+def ensure_index_compatible(index_path: Path, vision_model: str) -> None:
     metadata_path = index_path / METADATA_FILENAME
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         raise IndexRebuildRequiredError("索引缺少 Embedding 模型信息，请重新构建索引") from None
 
-    if not isinstance(metadata, dict) or metadata.get("provider") != "siliconflow" or metadata.get("model") != embedding_model():
-        raise IndexRebuildRequiredError("索引使用了不同的 Embedding 模型，请重新构建索引")
+    if (not isinstance(metadata, dict) or metadata.get("provider") != "siliconflow" or
+            metadata.get("model") != embedding_model() or
+            metadata.get("vision_model") != vision_model or
+            metadata.get("schema") != INDEX_SCHEMA):
+        raise IndexRebuildRequiredError("索引模型或格式已变更，请重新构建统一索引")

@@ -12,7 +12,9 @@ from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlencode
 from services.embedding_service import DEFAULT_BASE_URL, ensure_index_compatible, load_embeddings
+from services.image_index_service import vision_model
 
 # 存储结构：sessions[session_id] = [{"role":"user|assistant","content":"..."}...]
 _sessions: dict[str, list[dict]] = defaultdict(list)
@@ -32,7 +34,7 @@ MODEL_PROVIDER = "deepseek"
 TEMPERATURE = 0
 GRADER_MODEL = "Qwen/Qwen3.8-27B"
 
-K = 3
+K = 5
 
 SYSTEM_INSTRUCTION = (
     "你是多模态 PDF 检索 RAG 助手，可以围绕用户上传的文档进行解析、检索和问答。\n"
@@ -85,35 +87,48 @@ def _load_vs(file_id: str) -> FAISS:
     idx_file = os.path.join(vs_path, "index.faiss")
     if not os.path.exists(idx_file):
         raise FileNotFoundError(f"FAISS index not found at {vs_path}; build index first.")
-    ensure_index_compatible(Path(vs_path))
-    return FAISS.load_local(vs_path, load_embeddings(), allow_dangerous_deserialization=True)
+    ensure_index_compatible(Path(vs_path), vision_model())
+    return FAISS.load_local(
+        vs_path, load_embeddings(), allow_dangerous_deserialization=True, normalize_L2=True
+    )
 
 # ---------------- 主流程：检索 + 判定 + 生成 ----------------
 async def retrieve(question: str, file_id: str) -> tuple[list[dict], str]:
     """
     返回 (citations, context_text)
-    citations: [{citation_id, fileId, rank, page, snippet, score, previewUrl}]
+    citations: [{citation_id, fileId, rank, page, snippet, score, previewUrl, kind}]
     context_text: 供 LLM 使用的拼接上下文
     """
     vs = _load_vs(file_id)
-    hits = vs.similarity_search_with_score(question, k=K)
+    hits = await asyncio.to_thread(vs.similarity_search_with_score, question, k=K)
     citations = []
     ctx_snippets = []
     for i, (doc, score) in enumerate(hits, start=1):
         snippet_short = (doc.page_content or "").strip()
-        if len(snippet_short) > 500:
-            snippet_short = snippet_short[:500] + "..."
+        if len(snippet_short) > 1000:
+            snippet_short = snippet_short[:1000] + "..."
         page = doc.metadata.get("page") or doc.metadata.get("page_number")
-        citations.append({
+        kind = doc.metadata.get("kind", "text")
+        image_url = (
+            "/api/v1/pdf/images?" + urlencode({"fileId": file_id, "imagePath": doc.metadata["imagePath"]})
+            if kind == "image" else None
+        )
+        citation = {
             "citation_id": f"{file_id}-c{i}",
             "fileId": file_id,
             "rank": i,
             "page": page,
             "snippet": (doc.page_content or "")[:4000],
             "score": float(score),
-            "previewUrl": f"/api/v1/pdf/page?fileId={file_id}&page={(page or 1)}&type=original",
-        })
-        ctx_snippets.append(f"[{i}] {snippet_short}")
+            "kind": kind,
+            "previewUrl": image_url or f"/api/v1/pdf/page?fileId={file_id}&page={(page or 1)}&type=original",
+        }
+        if image_url:
+            citation["imageUrl"] = image_url
+            ctx_snippets.append(f"[{i}] 第 {page} 页图片：{snippet_short}\n图片 URL：{image_url}")
+        else:
+            ctx_snippets.append(f"[{i}] {snippet_short}")
+        citations.append(citation)
     if not ctx_snippets:
         return [], ""
     context_text = "\n\n".join(ctx_snippets)
@@ -177,19 +192,6 @@ async def answer_stream(
         for i in range(0, len(text), 20):
             yield {"type": "token", "data": text[i:i+20]}
             await asyncio.sleep(0.005)
-
-    if branch == "with_context" and citations:
-        imgs = []
-        # 取前 2 张，避免过多（可按需改成 3）
-        for c in citations[:2]:
-            url = c.get("previewUrl")
-            if url:
-                # 生成 Markdown 图片行
-                imgs.append(f"![参考页 {c.get('rank', '')}]({url})")
-        if imgs:
-            tail = "\n\n---\n**相关页面预览**\n\n" + "\n\n".join(imgs)
-            # 作为一个额外 token 块发给前端
-            yield {"type": "token", "data": tail}
 
     # 将本轮问答写入历史（仅在提供 session_id 时）
     if session_id:

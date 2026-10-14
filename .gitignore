@@ -11,6 +11,7 @@ backend/data/
 frontend/node_modules/
 frontend/build/
 frontend/dist/
+.run/
 **/__pycache__/
 *.py[cod]
 .pytest_cache/

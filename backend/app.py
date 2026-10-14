@@ -2,7 +2,8 @@ from fastapi import FastAPI, UploadFile, File, Query, Body
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import asyncio, time, os, random, string, json
+import asyncio, time, os, random, string, json, re
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -13,7 +14,8 @@ from services.pdf_service import (
     save_upload, run_full_parse_pipeline,
     original_pdf_path, dir_original_pages, dir_parsed_pages, markdown_output
 )
-from services.index_service import build_faiss_index, search_faiss
+from services.index_service import build_multimodal_index, search_faiss
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse, JSONResponse
 from services.rag_service import retrieve, answer_stream, clear_history
 
@@ -53,6 +55,29 @@ def now_ts() -> int:
 
 def err(code: str, message: str) -> Dict[str, Any]:
     return {"error": {"code": code, "message": message}, "requestId": rid("req"), "ts": now_ts()}
+
+
+def restore_current_pdf(file_id: str) -> bool:
+    """Recover a parsed local PDF after a development server reload."""
+    if current_pdf["fileId"] == file_id:
+        return True
+    if current_pdf["fileId"] is not None or not re.fullmatch(r"f_[a-z0-9]{8}", file_id):
+        return False
+    folder = Path("data") / file_id
+    if not (folder / "original.pdf").is_file() or not (folder / "output.md").is_file():
+        return False
+    pages = len(list((folder / "pages" / "original").glob("page-*.png")))
+    if pages == 0:
+        return False
+    current_pdf.update({
+        "fileId": file_id,
+        "name": "original.pdf",
+        "pages": pages,
+        "status": "ready",
+        "progress": 100,
+        "errorMsg": None,
+    })
+    return True
 
 # ---------------- Pydantic 模型（契约） ----------------
 class ChatRequest(BaseModel):
@@ -157,11 +182,7 @@ async def pdf_parse(payload: Dict[str, Any] = Body(...), bg: BackgroundTasks = N
         except Exception as e:
             current_pdf["status"] = "error"
             current_pdf["progress"] = 0
-            current_pdf["errorMsg"] = (
-                "扫描版 PDF 需要安装 Tesseract OCR 及对应语言包"
-                if "tesseract is not installed" in str(e).lower()
-                else f"PDF 解析失败：{e}"
-            )
+            current_pdf["errorMsg"] = f"PDF 解析失败：{e}"
             print("Parse error:", e)
 
     if bg is not None:
@@ -174,7 +195,7 @@ async def pdf_parse(payload: Dict[str, Any] = Body(...), bg: BackgroundTasks = N
 # ---------------- PDF: 状态 ----------------
 @app.get(f"{API_PREFIX}/pdf/status", tags=["PDF"])
 async def pdf_status(fileId: str = Query(...)):
-    if not current_pdf["fileId"] or current_pdf["fileId"] != fileId:
+    if not restore_current_pdf(fileId):
         return {"status": "idle", "progress": 0}
     resp = {"status": current_pdf["status"], "progress": current_pdf["progress"]}
     if current_pdf["status"] == "error":
@@ -188,7 +209,7 @@ async def pdf_page(
     page: int = Query(..., ge=1),
     type: str = Query(..., pattern="^(original|parsed)$")
 ):
-    if not current_pdf["fileId"] or current_pdf["fileId"] != fileId:
+    if not restore_current_pdf(fileId):
         return JSONResponse(status_code=404, content=None)
 
     if current_pdf["status"] != "ready" and type == "parsed":
@@ -208,7 +229,7 @@ async def pdf_images(
     imagePath: str = Query(...)
 ):
     """获取PDF解析后的图片文件"""
-    if not current_pdf["fileId"] or current_pdf["fileId"] != fileId:
+    if not restore_current_pdf(fileId):
         return JSONResponse(status_code=404, content=None)
 
     # 构建图片文件的完整路径
@@ -245,19 +266,24 @@ class SearchRequest(BaseModel):
 @app.post(f"{API_PREFIX}/index/build", tags=["Index"])
 async def index_build(req: BuildIndexRequest):
     # 可校验：current_pdf["status"] 应为 ready
-    if not current_pdf["fileId"] or current_pdf["fileId"] != req.fileId:
+    if not restore_current_pdf(req.fileId):
         raise HTTPException(status_code=400, detail="FILE_NOT_FOUND_OR_NOT_CURRENT")
     if current_pdf["status"] != "ready":
         raise HTTPException(status_code=409, detail="NEED_PARSE_FIRST")
 
-    out = build_faiss_index(req.fileId)
+    try:
+        out = await run_in_threadpool(build_multimodal_index, req.fileId)
+    except Exception as exc:
+        return JSONResponse(
+            err("INDEX_BUILD_ERROR", f"索引构建失败：{str(exc)[:500]}"), status_code=502
+        )
     if not out.get("ok"):
         return JSONResponse(err(out.get("error", "INDEX_BUILD_ERROR"), "索引构建失败"), status_code=500)
-    return {"ok": True, "chunks": out["chunks"]}
+    return {"ok": True, "chunks": out["chunks"], "images": out["images"]}
 
 @app.post(f"{API_PREFIX}/index/search", tags=["Index"])
 async def index_search(req: SearchRequest):
-    out = search_faiss(req.fileId, req.query, req.k or 5)
+    out = await run_in_threadpool(search_faiss, req.fileId, req.query, req.k or 5)
     if not out.get("ok"):
         code = out.get("error", "INDEX_NOT_FOUND")
         message = "Embedding 模型已变更，请重新构建索引" if code == "INDEX_REBUILD_REQUIRED" else "请先构建索引"

@@ -18,6 +18,8 @@ export interface ChatCitation {
   rank: number;
   page: number | null;
   previewUrl: string;
+  kind?: 'text' | 'image';
+  imageUrl?: string;
   snippet?: string;
 }
 
@@ -67,7 +69,7 @@ export function getPdfPageUrl(fileId: string, page: number, type: 'original' | '
   return `${API_BASE_URL}/pdf/page?fileId=${encodeURIComponent(fileId)}&page=${page}&type=${type}`;
 }
 
-export async function buildIndex(fileId: string): Promise<{ ok: boolean; chunks: number }> {
+export async function buildIndex(fileId: string): Promise<{ ok: boolean; chunks: number; images: number }> {
   const response = await fetch(`${API_BASE_URL}/index/build`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

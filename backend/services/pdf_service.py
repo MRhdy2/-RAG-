@@ -1,6 +1,6 @@
 # services/pdf_service.py
 from __future__ import annotations
-import os, io, math, json
+import io
 from pathlib import Path
 from typing import Dict, Any, List
 import pymupdf
@@ -9,8 +9,6 @@ import matplotlib
 matplotlib.use("Agg")  # 服务器无头
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-
-from html2text import html2text
 
 # 统一的根目录：每个 fileId 一个子目录
 DATA_ROOT = Path("data")
@@ -56,8 +54,8 @@ def render_original_pages(file_id: str, dpi: int = 144):
             pix = page.get_pixmap(matrix=mat)
             (out_dir / f"page-{idx:04d}.png").write_bytes(pix.tobytes("png"))
 
-def extract_native_text_pages(file_id: str) -> List[List[Dict[str, Any]]] | None:
-    """读取 PDF 的文字与图片区域；遇到扫描页时交给 OCR 流程。"""
+def extract_native_text_pages(file_id: str) -> List[List[Dict[str, Any]]]:
+    """读取每页的原生文字与图片区域，保留扫描页供逐页 OCR。"""
     pages: List[List[Dict[str, Any]]] = []
     with pymupdf.open(original_pdf_path(file_id)) as doc:
         for page_number, page in enumerate(doc, start=1):
@@ -84,15 +82,72 @@ def extract_native_text_pages(file_id: str) -> List[List[Dict[str, Any]]] | None
                 if block_type != 0 or not content:
                     continue
                 add_block("Text", (x0, y0, x1, y1), content)
-            if sum(len(block["text"]) for block in blocks) < 20:
-                return None
-
             # get_image_info 返回页面上实际绘制的图片位置，也能识别内联图片。
             for image in page.get_image_info():
                 bbox = pymupdf.Rect(image["bbox"]) & page.rect
                 if not bbox.is_empty:
                     add_block("Image", bbox)
             pages.append(blocks)
+    return pages
+
+
+def _ocr_text_blocks(page, page_number: int, tessdata: Path) -> List[Dict[str, Any]]:
+    # 局部 OCR 保留已有文字层，并识别页面中的扫描图片。
+    textpage = page.get_textpage_ocr(
+        language="chi_sim+eng", dpi=200, full=False, tessdata=str(tessdata)
+    )
+    text_blocks = []
+    for x0, y0, x1, y1, content, _, block_type in page.get_text(
+        "blocks", sort=True, textpage=textpage
+    ):
+        content = content.strip()
+        if block_type != 0 or not content:
+            continue
+        text_blocks.append({
+            "text": content,
+            "metadata": {
+                "page_number": page_number,
+                "category": "Text",
+                "coordinates": {
+                    "points": [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+                    "layout_width": page.rect.width,
+                    "layout_height": page.rect.height,
+                },
+            },
+        })
+    return text_blocks
+
+
+def ocr_scanned_pages(file_id: str, pages: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
+    """仅对文字层不足且含图片的页面 OCR，保留其他页的原生文字。"""
+    scan_pages = [
+        page_number for page_number, blocks in enumerate(pages, start=1)
+        if sum(
+            len(block["text"].strip()) for block in blocks
+            if block["metadata"]["category"] == "Text"
+        ) < 20
+        and any(block["metadata"]["category"] == "Image" for block in blocks)
+    ]
+    if not scan_pages:
+        return pages
+
+    try:
+        tessdata = Path(pymupdf.get_tessdata())
+    except RuntimeError as exc:
+        raise RuntimeError("扫描页需要 Tesseract OCR 和中文语言包；macOS 可运行 brew install tesseract tesseract-lang") from exc
+    missing = [lang for lang in ("chi_sim", "eng") if not (tessdata / f"{lang}.traineddata").is_file()]
+    if missing:
+        raise RuntimeError(f"扫描页缺少 Tesseract 语言包：{', '.join(missing)}")
+
+    with pymupdf.open(original_pdf_path(file_id)) as doc:
+        for page_number in scan_pages:
+            page = doc.load_page(page_number - 1)
+            text_blocks = _ocr_text_blocks(page, page_number, tessdata)
+            image_blocks = [
+                block for block in pages[page_number - 1]
+                if block["metadata"]["category"] == "Image"
+            ]
+            pages[page_number - 1] = text_blocks + image_blocks
     return pages
 
 def _plot_boxes_to_ax(ax, pix, segments):
@@ -148,22 +203,6 @@ def render_parsed_pages_with_boxes(file_id: str, docs_local: List[Dict[str, Any]
             fig.savefig(out_dir / f"page-{page_number:04d}.png", bbox_inches="tight", pad_inches=0)
             plt.close(fig)
 
-def unstructured_segments(file_id: str) -> List[Any]:
-    """扫描版 PDF 使用 Unstructured 的 OCR 布局分析。"""
-    from langchain_unstructured import UnstructuredLoader
-
-    pdf_path = str(original_pdf_path(file_id))
-    loader = UnstructuredLoader(
-        file_path=pdf_path,
-        strategy="hi_res",
-        infer_table_structure=True,
-        languages=["chi_sim", "eng"],
-    )
-    out = []
-    for d in loader.lazy_load():
-        out.append(d)
-    return out
-
 def extract_embedded_images(file_id: str) -> Dict[int, List[str]]:
     pdf_path = str(original_pdf_path(file_id))
     img_dir = images_dir(file_id)
@@ -171,12 +210,12 @@ def extract_embedded_images(file_id: str) -> Dict[int, List[str]]:
     with pymupdf.open(pdf_path) as doc:
         for page_num, page in enumerate(doc, start=1):
             image_map[page_num] = []
-            for img_index, img in enumerate(page.get_images(full=True), start=1):
-                pix = pymupdf.Pixmap(doc, img[0])
+            # Image blocks include inline images, which page.get_images() omits.
+            image_blocks = (block for block in page.get_text("dict")["blocks"] if block["type"] == 1)
+            for img_index, block in enumerate(image_blocks, start=1):
                 img_path = img_dir / f"page{page_num}_img{img_index}.png"
-                if pix.n >= 5:
-                    pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-                pix.save(str(img_path))
+                with Image.open(io.BytesIO(block["image"])) as image:
+                    image.convert("RGB").save(img_path, format="PNG")
                 image_map[page_num].append(img_path.name)
     return image_map
 
@@ -192,68 +231,15 @@ def native_pdf_to_markdown(file_id: str, pages: List[List[Dict[str, Any]]]) -> D
     out_md.write_text("\n\n".join(md_lines) + "\n", encoding="utf-8")
     return {"markdown": out_md.name, "images_dir": "images"}
 
-def pdf_to_markdown(file_id: str):
-    from unstructured.partition.pdf import partition_pdf
-
-    pdf_path = str(original_pdf_path(file_id))
-    out_md = markdown_output(file_id)
-
-    elements = partition_pdf(
-        filename=pdf_path,
-        infer_table_structure=True,
-        strategy="hi_res",
-        languages=["chi_sim", "eng"],
-    )
-
-    image_map = extract_embedded_images(file_id)
-
-    md_lines: List[str] = []
-    inserted_images = set()
-    for el in elements:
-        cat = getattr(el, "category", None)
-        text = (getattr(el, "text", "") or "").strip()
-        meta = getattr(el, "metadata", None)
-        page_num = getattr(meta, "page_number", None) if meta else None
-
-        if not text and cat != "Image":
-            continue
-
-        if cat == "Title" and text.startswith("- "):
-            md_lines.append(text + "\n")
-        elif cat == "Title":
-            md_lines.append(f"# {text}\n")
-        elif cat in ["Header", "Subheader"]:
-            md_lines.append(f"## {text}\n")
-        elif cat == "Table":
-            html = getattr(meta, "text_as_html", None) if meta else None
-            if html:
-                md_lines.append(html2text(html) + "\n")
-            else:
-                md_lines.append((text or "") + "\n")
-        elif cat == "Image" and page_num:
-            for name in image_map.get(page_num, []):
-                if (page_num, name) not in inserted_images:
-                    md_lines.append(f"![Image](./images/{name})\n")
-                    inserted_images.add((page_num, name))
-        else:
-            md_lines.append(text + "\n")
-
-    out_md.write_text("\n".join(md_lines), encoding="utf-8")
-    return {"markdown": out_md.name, "images_dir": "images"}
-
 def run_full_parse_pipeline(file_id: str) -> Dict[str, Any]:
     """
     完整流程：文字层优先直读；扫描件使用 OCR；随后渲染页图并输出 Markdown。
     返回用于 /status 的统计或元信息
     """
-    native_pages = extract_native_text_pages(file_id)
+    pages = extract_native_text_pages(file_id)
+    pages = ocr_scanned_pages(file_id, pages)
     render_original_pages(file_id)
-    if native_pages is not None:
-        docs = [block for page in native_pages for block in page]
-        render_parsed_pages_with_boxes(file_id, docs)
-        md_info = native_pdf_to_markdown(file_id, native_pages)
-    else:
-        docs = unstructured_segments(file_id)
-        render_parsed_pages_with_boxes(file_id, docs)
-        md_info = pdf_to_markdown(file_id)
+    docs = [block for page in pages for block in page]
+    render_parsed_pages_with_boxes(file_id, docs)
+    md_info = native_pdf_to_markdown(file_id, pages)
     return {"md": md_info["markdown"]}

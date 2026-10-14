@@ -41,7 +41,7 @@ class EmbeddingServiceTests(unittest.TestCase):
             config = self.service.load_embeddings().kwargs
         self.assertEqual(config["api_key"], "siliconflow-key")
         self.assertEqual(config["base_url"], "https://api.siliconflow.cn/v1")
-        self.assertEqual(config["model"], "Qwen/Qwen3-Embedding-8B")
+        self.assertEqual(config["model"], "Qwen/Qwen3-VL-Embedding-8B")
         self.assertFalse(config["check_embedding_ctx_length"])
         self.assertEqual(config["encoding_format"], "float")
 
@@ -55,15 +55,16 @@ class EmbeddingServiceTests(unittest.TestCase):
             index_path = Path(directory)
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(self.service.IndexRebuildRequiredError):
-                    self.service.ensure_index_compatible(index_path)
-                self.service.save_index_metadata(index_path)
-                self.service.ensure_index_compatible(index_path)
+                    self.service.ensure_index_compatible(index_path, "Qwen/Qwen3.6-35B-A3B")
+                self.service.save_index_metadata(index_path, "Qwen/Qwen3.6-35B-A3B")
+                self.service.ensure_index_compatible(index_path, "Qwen/Qwen3.6-35B-A3B")
                 metadata = json.loads((index_path / "embedding.json").read_text())
-                self.assertEqual(metadata["model"], "Qwen/Qwen3-Embedding-8B")
+                self.assertEqual(metadata["model"], "Qwen/Qwen3-VL-Embedding-8B")
+                self.assertEqual(metadata["schema"], "unified-text-image-v1")
 
-            with patch.dict(os.environ, {"SILICONFLOW_EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-4B"}, clear=True):
+            with patch.dict(os.environ, {"SILICONFLOW_EMBEDDING_MODEL": "another-model"}, clear=True):
                 with self.assertRaises(self.service.IndexRebuildRequiredError):
-                    self.service.ensure_index_compatible(index_path)
+                    self.service.ensure_index_compatible(index_path, "Qwen/Qwen3.6-35B-A3B")
 
 
 if __name__ == "__main__":

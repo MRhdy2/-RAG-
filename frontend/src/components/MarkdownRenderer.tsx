@@ -92,6 +92,7 @@ function Img(props: React.ImgHTMLAttributes<HTMLImageElement>) {
 function ReferenceCard({ reference, index }: { reference: Reference; index: number }) {
   const snippet = reference.snippet || "";
   const previewUrl = reference.previewUrl ? toAbsoluteApiUrl(reference.previewUrl) : "";
+  const imageUrl = reference.imageUrl ? toAbsoluteApiUrl(reference.imageUrl) : "";
 
   return (
     <div className="bg-muted/20 rounded-lg p-3 border border-border/30">
@@ -103,6 +104,9 @@ function ReferenceCard({ reference, index }: { reference: Reference; index: numb
           <div className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">
             {snippet ? (snippet.length > 200 ? snippet.slice(0, 200) + "…" : snippet) : "（无文本片段）"}
           </div>
+          {reference.kind === "image" && imageUrl && (
+            <img src={imageUrl} alt={`第 ${reference.page ?? "?"} 页检索图片`} className="mt-2 max-h-48 max-w-full rounded border border-border/30 object-contain" loading="lazy" />
+          )}
           {previewUrl && (
             <a
               className="mt-2 inline-flex items-center text-xs px-2 py-1 rounded bg-white/10 hover:bg-white/20"
@@ -111,7 +115,7 @@ function ReferenceCard({ reference, index }: { reference: Reference; index: numb
               rel="noopener noreferrer"
             >
               <ExternalLink className="w-3 h-3 mr-1" />
-              查看原页
+              {reference.kind === "image" ? "查看图片" : "查看原页"}
             </a>
           )}
         </div>
@@ -128,6 +132,8 @@ export type Reference = {
   rank?: number;
   snippet?: string;
   previewUrl?: string;
+  kind?: "text" | "image";
+  imageUrl?: string;
 };
 
 export function MarkdownRenderer({

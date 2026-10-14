@@ -106,10 +106,10 @@ export function PDFPanel({ className, onFileReady, onFileReset }: PDFPanelProps)
       if (status.status === 'ready') {
         setUploadStatus('indexing');
         try {
-          await buildIndex(uploadedFileId);
+          const index = await buildIndex(uploadedFileId);
           if (requestId !== requestIdRef.current) return;
           setUploadStatus('ready');
-          toast.success('PDF 已解析并建立索引');
+          toast.success(`PDF 已解析，已索引 ${index.chunks} 个文本块和 ${index.images} 张图片`);
           onFileReady?.(uploadedFileId, uploadedName, pages);
         } catch (error) {
           if (requestId !== requestIdRef.current) return;
@@ -138,12 +138,12 @@ export function PDFPanel({ className, onFileReady, onFileReset }: PDFPanelProps)
     setUploadStatus('indexing');
     setErrorMessage('');
     try {
-      await buildIndex(fileId);
+      const index = await buildIndex(fileId);
       if (requestId !== requestIdRef.current) return;
       setIndexingFailed(false);
       setUploadStatus('ready');
       onFileReady?.(fileId, fileName, totalPages);
-      toast.success('索引已重建');
+      toast.success(`索引已重建：${index.chunks} 个文本块、${index.images} 张图片`);
     } catch (error) {
       if (requestId !== requestIdRef.current) return;
       setUploadStatus('error');
@@ -301,14 +301,11 @@ export function PDFPanel({ className, onFileReady, onFileReset }: PDFPanelProps)
           </div>
         )}
 
-        {uploadStatus === 'error' && errorMessage && (
+        {uploadStatus === 'error' && indexingFailed && (
           <div className="mt-4 p-3 bg-destructive/10 border border-destructive/30 rounded-lg">
-            <p className="text-xs text-destructive">{errorMessage}</p>
-            {indexingFailed && (
-              <Button variant="outline" size="sm" className="mt-2" onClick={retryIndex}>
-                重试建立索引
-              </Button>
-            )}
+            <Button variant="outline" size="sm" onClick={retryIndex}>
+              重试建立索引
+            </Button>
           </div>
         )}
 
@@ -402,9 +399,9 @@ export function PDFPanel({ className, onFileReady, onFileReset }: PDFPanelProps)
                   <AlertCircle className="w-10 h-10 text-red-500" />
                 </div>
                 <div className="space-y-2">
-                  <h3 className="font-semibold text-foreground">Upload failed</h3>
+                  <h3 className="font-semibold text-foreground">PDF 处理失败</h3>
                   <p className="text-sm text-muted-foreground/80">
-                    There was an error processing your document. Please try again.
+                    {errorMessage || '处理文档时出错，请重试。'}
                   </p>
                 </div>
               </>

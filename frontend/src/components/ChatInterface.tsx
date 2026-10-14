@@ -16,6 +16,8 @@ type Reference = {
   rank?: number;
   snippet?: string;
   previewUrl?: string;
+  kind?: "text" | "image";
+  imageUrl?: string;
 };
 
 type Message = {
@@ -136,6 +138,8 @@ export function ChatInterface({
             rank: c.rank,
             snippet: c.snippet,
             previewUrl: c.previewUrl,
+            kind: c.kind,
+            imageUrl: c.imageUrl,
           };
 
           // 更新 state & ref
