@@ -1,5 +1,6 @@
 # services/index_service.py
 from __future__ import annotations
+import json
 import re
 import shutil
 from pathlib import Path
@@ -59,13 +60,51 @@ def split_markdown(md_text: str) -> List[Document]:
         cleaned.append(Document(page_content=txt, metadata=metadata))
     return cleaned
 
+
+def split_mineru_content(content: list[dict]) -> List[Document]:
+    """Use MinerU's zero-based page indices for searchable text citations."""
+    pages: Dict[int, List[str]] = {}
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        page_idx = block.get("page_idx")
+        if not isinstance(page_idx, int) or page_idx < 0:
+            continue
+        parts = []
+        for field in ("text", "table_body", "code_body", "content"):
+            value = block.get(field)
+            if isinstance(value, str) and value.strip() and value not in parts:
+                parts.append(value.strip())
+        for field in ("list_items", "image_caption", "table_caption", "chart_caption"):
+            value = block.get(field)
+            if isinstance(value, list):
+                parts.extend(str(item).strip() for item in value if str(item).strip())
+        if parts:
+            pages.setdefault(page_idx + 1, []).append("\n".join(parts))
+
+    docs: List[Document] = []
+    for page, blocks in sorted(pages.items()):
+        text = "\n\n".join(blocks)
+        for start in range(0, len(text), 8000):
+            chunk = text[start:start + 8000].strip()
+            if chunk:
+                docs.append(Document(page_content=chunk, metadata={"page": page, "kind": "text"}))
+    return docs
+
 def build_faiss_index(file_id: str) -> Dict[str, Any]:
     md_file = markdown_path(file_id)
     if not md_file.exists():
         return {"ok": False, "error": "MARKDOWN_NOT_FOUND"}
     md_text = md_file.read_text(encoding="utf-8")
 
-    docs = split_markdown(md_text)
+    content_file = workdir(file_id) / "content_list.json"
+    if content_file.is_file():
+        content = json.loads(content_file.read_text(encoding="utf-8"))
+        docs = split_mineru_content(content)
+        if not docs and md_text.strip():
+            docs = split_markdown(md_text)
+    else:
+        docs = split_markdown(md_text)
     image_items = prepare_image_embeddings(file_id)
     if not docs and not image_items:
         return {"ok": False, "error": "EMPTY_MD"}

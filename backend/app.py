@@ -245,7 +245,7 @@ async def pdf_images(
     except ValueError:
         return JSONResponse(err("INVALID_PATH", "无效的图片路径"), status_code=400)
 
-    return FileResponse(str(image_file), media_type="image/png")
+    return FileResponse(str(image_file))
 
 # ---------------- PDF: 引用片段 ----------------
 @app.get(f"{API_PREFIX}/pdf/chunk", tags=["PDF"])

@@ -39,6 +39,35 @@ class FakeTextEmbeddings(Embeddings):
 
 
 class UnifiedIndexTests(unittest.TestCase):
+    def test_mineru_content_and_jpeg_image_share_page_aware_index(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client = FakeSiliconFlowClient()
+            with patch.object(pdf_service, "DATA_ROOT", root), \
+                    patch.object(index_service, "DATA_ROOT", root), \
+                    patch.object(image_index_service, "_client", return_value=client), \
+                    patch.object(index_service, "load_embeddings", return_value=FakeTextEmbeddings()):
+                file_id = "mineru-pdf"
+                Image.new("RGB", (60, 40), "red").save(
+                    pdf_service.images_dir(file_id) / "figure.jpg", format="JPEG"
+                )
+                index_service.markdown_path(file_id).write_text(
+                    "## MinerU title\n\n![figure](images/figure.jpg)\n", encoding="utf-8"
+                )
+                (pdf_service.workdir(file_id) / "content_list.json").write_text(
+                    json.dumps([{"type": "text", "page_idx": 1, "text": "第二页的系统架构"}]),
+                    encoding="utf-8",
+                )
+                (pdf_service.workdir(file_id) / "image_pages.json").write_text(
+                    json.dumps({"figure.jpg": 2}), encoding="utf-8"
+                )
+
+                result = index_service.build_multimodal_index(file_id)
+                self.assertEqual(result, {"ok": True, "chunks": 1, "images": 1})
+                hits = index_service.search_faiss(file_id, "流程图", k=2)["results"]
+                self.assertEqual({hit["metadata"]["page"] for hit in hits}, {2})
+                self.assertEqual({hit["kind"] for hit in hits}, {"text", "image"})
+
     def test_vision_description_retries_empty_response_without_thinking(self):
         client = FakeSiliconFlowClient()
         responses = ["", "图中展示了三个处理步骤。"]

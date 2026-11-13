@@ -112,11 +112,17 @@ def _load_cache(path: Path) -> dict:
 
 
 def _image_paths(file_id: str) -> list[tuple[int, Path]]:
-    paths = []
-    for path in images_dir(file_id).glob("*.png"):
+    page_map = _load_cache(workdir(file_id) / "image_pages.json")
+    paths: list[tuple[int, str, Path]] = []
+    for path in images_dir(file_id).iterdir():
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
+            continue
         match = IMAGE_PATTERN.fullmatch(path.name)
-        if match:
-            paths.append((int(match.group(1)), int(match.group(2)), path))
+        page = page_map.get(path.name)
+        if not isinstance(page, int) or page < 1:
+            page = int(match.group(1)) if match else None
+        if page is not None:
+            paths.append((page, path.name, path))
     return [(page, path) for page, _, path in sorted(paths)]
 
 

@@ -1,10 +1,12 @@
 # services/pdf_service.py
 from __future__ import annotations
-import io
-from pathlib import Path
+import json
+import os
+from pathlib import Path, PurePosixPath
 from typing import Dict, Any, List
 import pymupdf
 from PIL import Image
+from dotenv import load_dotenv
 import matplotlib
 matplotlib.use("Agg")  # 服务器无头
 import matplotlib.pyplot as plt
@@ -54,101 +56,72 @@ def render_original_pages(file_id: str, dpi: int = 144):
             pix = page.get_pixmap(matrix=mat)
             (out_dir / f"page-{idx:04d}.png").write_bytes(pix.tobytes("png"))
 
-def extract_native_text_pages(file_id: str) -> List[List[Dict[str, Any]]]:
-    """读取每页的原生文字与图片区域，保留扫描页供逐页 OCR。"""
-    pages: List[List[Dict[str, Any]]] = []
+def content_list_path(file_id: str) -> Path:
+    return workdir(file_id) / "content_list.json"
+
+
+def image_pages_path(file_id: str) -> Path:
+    return workdir(file_id) / "image_pages.json"
+
+
+def _content_page(item: Dict[str, Any], page_count: int) -> int | None:
+    page_idx = item.get("page_idx")
+    if isinstance(page_idx, int) and 0 <= page_idx < page_count:
+        return page_idx + 1
+    return None
+
+
+def _save_mineru_result(file_id: str, result, page_count: int) -> List[Dict[str, Any]]:
+    if result.state != "done" or not result.markdown or not result.markdown.strip():
+        raise RuntimeError(f"MinerU 精细解析未返回 Markdown：{result.error or result.state}")
+    names = [image.name for image in result.images]
+    if len(names) != len(set(names)):
+        raise RuntimeError("MinerU 返回了重名图片，无法安全保存")
+
+    result.save_markdown(str(markdown_output(file_id)), with_images=True)
+    content = result.content_list or []
+    if not isinstance(content, list):
+        raise RuntimeError("MinerU 返回的内容列表格式无效")
+    content_list_path(file_id).write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+
+    image_pages: Dict[str, int] = {}
+    segments: List[Dict[str, Any]] = []
     with pymupdf.open(original_pdf_path(file_id)) as doc:
-        for page_number, page in enumerate(doc, start=1):
-            blocks = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            page_number = _content_page(item, page_count)
+            if page_number is None:
+                continue
+            image_path = item.get("img_path") or item.get("image_path")
+            if isinstance(image_path, str):
+                image_pages[PurePosixPath(image_path).name] = page_number
 
-            def add_block(category: str, bbox, content: str = "") -> None:
-                x0, y0, x1, y1 = bbox
-                blocks.append({
-                    "text": content,
-                    "metadata": {
-                        "page_number": page_number,
-                        "category": category,
-                        "coordinates": {
-                            "points": [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
-                            "layout_width": page.rect.width,
-                            "layout_height": page.rect.height,
-                        },
-                    },
-                })
-
-            for block in page.get_text("blocks", sort=True):
-                x0, y0, x1, y1, content, _, block_type = block
-                content = content.strip()
-                if block_type != 0 or not content:
-                    continue
-                add_block("Text", (x0, y0, x1, y1), content)
-            # get_image_info 返回页面上实际绘制的图片位置，也能识别内联图片。
-            for image in page.get_image_info():
-                bbox = pymupdf.Rect(image["bbox"]) & page.rect
-                if not bbox.is_empty:
-                    add_block("Image", bbox)
-            pages.append(blocks)
-    return pages
-
-
-def _ocr_text_blocks(page, page_number: int, tessdata: Path) -> List[Dict[str, Any]]:
-    # 局部 OCR 保留已有文字层，并识别页面中的扫描图片。
-    textpage = page.get_textpage_ocr(
-        language="chi_sim+eng", dpi=200, full=False, tessdata=str(tessdata)
-    )
-    text_blocks = []
-    for x0, y0, x1, y1, content, _, block_type in page.get_text(
-        "blocks", sort=True, textpage=textpage
-    ):
-        content = content.strip()
-        if block_type != 0 or not content:
-            continue
-        text_blocks.append({
-            "text": content,
-            "metadata": {
+            bbox = item.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            try:
+                x0, y0, x1, y1 = (float(value) for value in bbox)
+            except (TypeError, ValueError):
+                continue
+            page = doc[page_number - 1]
+            x0, x1 = x0 * page.rect.width / 1000, x1 * page.rect.width / 1000
+            y0, y1 = y0 * page.rect.height / 1000, y1 * page.rect.height / 1000
+            if x1 <= x0 or y1 <= y0:
+                continue
+            kind = item.get("type")
+            category = "Image" if kind in ("image", "chart") else "Table" if kind == "table" else "Text"
+            segments.append({"metadata": {
                 "page_number": page_number,
-                "category": "Text",
+                "category": category,
                 "coordinates": {
                     "points": [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
                     "layout_width": page.rect.width,
                     "layout_height": page.rect.height,
                 },
-            },
-        })
-    return text_blocks
-
-
-def ocr_scanned_pages(file_id: str, pages: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
-    """仅对文字层不足且含图片的页面 OCR，保留其他页的原生文字。"""
-    scan_pages = [
-        page_number for page_number, blocks in enumerate(pages, start=1)
-        if sum(
-            len(block["text"].strip()) for block in blocks
-            if block["metadata"]["category"] == "Text"
-        ) < 20
-        and any(block["metadata"]["category"] == "Image" for block in blocks)
-    ]
-    if not scan_pages:
-        return pages
-
-    try:
-        tessdata = Path(pymupdf.get_tessdata())
-    except RuntimeError as exc:
-        raise RuntimeError("扫描页需要 Tesseract OCR 和中文语言包；macOS 可运行 brew install tesseract tesseract-lang") from exc
-    missing = [lang for lang in ("chi_sim", "eng") if not (tessdata / f"{lang}.traineddata").is_file()]
-    if missing:
-        raise RuntimeError(f"扫描页缺少 Tesseract 语言包：{', '.join(missing)}")
-
-    with pymupdf.open(original_pdf_path(file_id)) as doc:
-        for page_number in scan_pages:
-            page = doc.load_page(page_number - 1)
-            text_blocks = _ocr_text_blocks(page, page_number, tessdata)
-            image_blocks = [
-                block for block in pages[page_number - 1]
-                if block["metadata"]["category"] == "Image"
-            ]
-            pages[page_number - 1] = text_blocks + image_blocks
-    return pages
+            }})
+    image_pages_path(file_id).write_text(json.dumps(image_pages, ensure_ascii=False), encoding="utf-8")
+    return segments
 
 def _plot_boxes_to_ax(ax, pix, segments):
     category_to_color = {
@@ -203,43 +176,23 @@ def render_parsed_pages_with_boxes(file_id: str, docs_local: List[Dict[str, Any]
             fig.savefig(out_dir / f"page-{page_number:04d}.png", bbox_inches="tight", pad_inches=0)
             plt.close(fig)
 
-def extract_embedded_images(file_id: str) -> Dict[int, List[str]]:
-    pdf_path = str(original_pdf_path(file_id))
-    img_dir = images_dir(file_id)
-    image_map: Dict[int, List[str]] = {}
-    with pymupdf.open(pdf_path) as doc:
-        for page_num, page in enumerate(doc, start=1):
-            image_map[page_num] = []
-            # Image blocks include inline images, which page.get_images() omits.
-            image_blocks = (block for block in page.get_text("dict")["blocks"] if block["type"] == 1)
-            for img_index, block in enumerate(image_blocks, start=1):
-                img_path = img_dir / f"page{page_num}_img{img_index}.png"
-                with Image.open(io.BytesIO(block["image"])) as image:
-                    image.convert("RGB").save(img_path, format="PNG")
-                image_map[page_num].append(img_path.name)
-    return image_map
-
-def native_pdf_to_markdown(file_id: str, pages: List[List[Dict[str, Any]]]) -> Dict[str, str]:
-    """保留页码和文字顺序，供索引与引用使用。"""
-    image_map = extract_embedded_images(file_id)
-    md_lines: List[str] = []
-    for page_number, blocks in enumerate(pages, start=1):
-        md_lines.append(f"# 第 {page_number} 页")
-        md_lines.extend(block["text"] for block in blocks if block["text"])
-        md_lines.extend(f"![Image](./images/{name})" for name in image_map[page_number])
-    out_md = markdown_output(file_id)
-    out_md.write_text("\n\n".join(md_lines) + "\n", encoding="utf-8")
-    return {"markdown": out_md.name, "images_dir": "images"}
-
 def run_full_parse_pipeline(file_id: str) -> Dict[str, Any]:
-    """
-    完整流程：文字层优先直读；扫描件使用 OCR；随后渲染页图并输出 Markdown。
-    返回用于 /status 的统计或元信息
-    """
-    pages = extract_native_text_pages(file_id)
-    pages = ocr_scanned_pages(file_id, pages)
+    """使用 MinerU 精细解析生成 Markdown 与图片，PyMuPDF 仅用于预览渲染。"""
+    from mineru import MinerU
+
+    load_dotenv(override=True)
+    token = os.getenv("MINERU_TOKEN") or os.getenv("MINERU_API_KEY")
+    if not token:
+        raise RuntimeError("缺少 MINERU_TOKEN，请在 backend/.env 中配置 MinerU API Token")
+
+    with pymupdf.open(original_pdf_path(file_id)) as doc:
+        page_count = doc.page_count
+    with MinerU(token) as client:
+        result = client.extract(
+            str(original_pdf_path(file_id)), model="vlm", ocr=True,
+            formula=True, table=True, language="ch", timeout=1800,
+        )
+    segments = _save_mineru_result(file_id, result, page_count)
     render_original_pages(file_id)
-    docs = [block for page in pages for block in page]
-    render_parsed_pages_with_boxes(file_id, docs)
-    md_info = native_pdf_to_markdown(file_id, pages)
-    return {"md": md_info["markdown"]}
+    render_parsed_pages_with_boxes(file_id, segments)
+    return {"md": markdown_output(file_id).name}
